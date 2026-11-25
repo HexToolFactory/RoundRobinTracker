@@ -4,6 +4,7 @@
 ## Author: HexToolFactory
 ## Version: @project-version@
 ## Category: Loot
+## X-Curse-Project-ID: 1830287
 ## IconTexture: Interface\Icons\INV_Misc_Dice_02
 ## SavedVariables: RoundRobinTrackerDB
 
