@@ -1,0 +1,11 @@
+## Interface: 16001
+## Title: Round Robin Tracker
+## Notes: Counts chosen items looted by each group member until you reset. /rrt
+## Author: HexToolFactory
+## Version: @project-version@
+## Category: Loot
+## IconTexture: Interface\Icons\INV_Misc_Dice_02
+## SavedVariables: RoundRobinTrackerDB
+
+Items.lua
+Core.lua
