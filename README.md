@@ -30,6 +30,16 @@ Round Robin: [Righteous Orb] round 1 complete
 
 WoW: Forever locks addon chat during combat. Messages wait and post as soon as it opens.
 
+## Scourgestones and the Argent Dawn Commission
+Scourgestones drop only for players wearing the Argent Dawn Commission. For Minion's, Invader's and
+Corruptor's Scourgestone, a group member without its buff is left out of the round: "-" in the window and the
+table, not in the turn line, and named in the round message:
+```
+Round Robin: [Corruptor's Scourgestone] round 1 complete (left out: Bob Stone - no Argent Dawn Commission)
+```
+Buffs can only be read out of combat; the last state read is kept. Someone who loots a Scourgestone counts again.
+`/rrt commission` shows who has it.
+
 ## Commands
 ```
 /rrt                     window
@@ -40,6 +50,7 @@ WoW: Forever locks addon chat during combat. Messages wait and post as soon as i
 /rrt reset               all counts to 0
 /rrt announce on|off     round complete / broke the round messages
 /rrt autoreport on|off   table when a tracked item is up for roll
+/rrt commission          who has the Argent Dawn Commission
 ```
 
 ## How it counts

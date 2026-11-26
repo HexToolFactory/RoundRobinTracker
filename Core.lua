@@ -1,6 +1,6 @@
 -- Round Robin Tracker: counts chosen items looted by each group member, from the loot chat lines, until reset.
 local _, ns = ...
-local VERSION = "0.8.1"
+local VERSION = "0.9.0"
 
 local DB
 local ITEMS = ns and ns.ITEMS or {} -- [itemID] = English name, from Items.lua (QuestieDB data)
@@ -54,6 +54,8 @@ local function initDB()
 	DB.seen = DB.seen or {} -- [itemID] = { name, link, t }: items in any loot line, for the add box suggestions
 	DB.history = DB.history or {} -- [itemID] = { name, link, t }: items tracked before
 	DB.rounds = DB.rounds or {} -- [item key] = last round announced
+	DB.commission = DB.commission or {} -- [squashed name] = true / false: Argent Dawn Commission buff, last read
+	DB.proven = DB.proven or {} -- [squashed name] = true: looted a Scourgestone since the last reset, so they have it
 	if DB.announce == nil then
 		DB.announce = true -- post "round N complete" to group chat
 	end
@@ -78,9 +80,23 @@ end
 -- group
 ---------------------------------------------------------------------------------------------------------
 
+local function groupUnits()
+	local units = { "player" }
+	if IsInRaid() then
+		for i = 1, GetNumGroupMembers() do
+			units[#units + 1] = "raid" .. i
+		end
+	elseif IsInGroup() then
+		for i = 1, GetNumSubgroupMembers() do
+			units[#units + 1] = "party" .. i
+		end
+	end
+	return units
+end
+
 local function roster()
 	local list, seen = {}, {}
-	local function add(unit)
+	for _, unit in ipairs(groupUnits()) do
 		local name = GetUnitName(unit, true)
 		if name and not seen[squash(name)] then
 			seen[squash(name)] = true
@@ -91,17 +107,125 @@ local function roster()
 			end
 		end
 	end
-	add("player")
-	if IsInRaid() then
-		for i = 1, GetNumGroupMembers() do
-			add("raid" .. i)
-		end
-	elseif IsInGroup() then
-		for i = 1, GetNumSubgroupMembers() do
-			add("party" .. i)
+	return list
+end
+
+---------------------------------------------------------------------------------------------------------
+-- Argent Dawn Commission: Scourgestones drop only for players wearing it, so players without it are left
+-- out of the round robin for those items (shown as "-"). The buff is read out of combat only (aura data
+-- is secret in combat on Forever); the last state read is kept. Never read = counts as having it.
+---------------------------------------------------------------------------------------------------------
+
+local COMMISSION_SPELL = 17670
+local COMMISSION_NAME = "Argent Dawn Commission"
+local COMMISSION_ITEMS = { [12840] = true, [12841] = true, [12843] = true } -- Minion's, Invader's, Corruptor's
+local COMMISSION_NAMES = {
+	["minion's scourgestone"] = true,
+	["invader's scourgestone"] = true,
+	["corruptor's scourgestone"] = true,
+}
+
+local function needsCommission(entry)
+	if not entry then
+		return false
+	end
+	if entry.id then
+		return COMMISSION_ITEMS[entry.id] == true
+	end
+	return COMMISSION_NAMES[lower(entry.name)] == true
+end
+
+local function anyNeedsCommission()
+	for _, entry in ipairs(DB.items) do
+		if needsCommission(entry) then
+			return true
 		end
 	end
-	return list
+	return false
+end
+
+-- true / false, or nil when it cannot be read now (combat, secret, offline, too far away)
+local function readCommission(unit)
+	if InCombatLockdown and InCombatLockdown() then
+		return nil
+	end
+	if UnitIsConnected and not UnitIsConnected(unit) then
+		return nil
+	end
+	local get = C_UnitAuras and C_UnitAuras.GetBuffDataByIndex
+	if not get then
+		return nil
+	end
+	local any = false
+	for i = 1, 255 do
+		local ok, aura = pcall(get, unit, i, "HELPFUL")
+		if not ok or aura == nil then
+			break
+		end
+		if plain(aura) == nil then
+			return nil
+		end
+		local id, name = plain(aura.spellId), plain(aura.name)
+		if id == nil and name == nil then
+			return nil -- fields secret
+		end
+		any = true
+		if id == COMMISSION_SPELL or name == COMMISSION_NAME then
+			return true
+		end
+	end
+	if not any and UnitIsVisible and not UnitIsVisible(unit) then
+		return nil -- no aura data for far-away members
+	end
+	return false
+end
+
+local refresh -- UI, defined below
+
+-- returns true when a state changed
+local function scanUnit(unit)
+	local name = GetUnitName(unit, true)
+	if not name then
+		return false
+	end
+	local has = readCommission(unit)
+	if has == nil or DB.commission[squash(name)] == has then
+		return false
+	end
+	DB.commission[squash(name)] = has
+	return true
+end
+
+local function scanCommission()
+	if not anyNeedsCommission() then
+		return
+	end
+	local changed = false
+	for _, unit in ipairs(groupUnits()) do
+		if scanUnit(unit) then
+			changed = true
+		end
+	end
+	if changed then
+		refresh()
+	end
+end
+
+-- does this player take part in the round robin of this item
+local function eligible(name, entry)
+	return not needsCommission(entry) or DB.proven[squash(name)] or DB.commission[squash(name)] ~= false
+end
+
+local function leftOut(entry)
+	local out = {}
+	if needsCommission(entry) then
+		for _, name in ipairs(roster()) do
+			if not eligible(name, entry) then
+				out[#out + 1] = name
+			end
+		end
+	end
+	return out
 end
 
 -- the name we file a looter under: group member first, then someone already counted, else as written
@@ -222,7 +346,6 @@ local function findTracked(link)
 	return nil
 end
 
-local refresh -- UI, defined below
 
 local function addItem(input)
 	local entry = resolve(input)
@@ -241,6 +364,7 @@ local function addItem(input)
 		DB.history[entry.id] = { name = entry.name, link = entry.link, t = time() }
 	end
 	msg("Tracking " .. entryLabel(entry))
+	scanCommission()
 	refresh()
 end
 
@@ -287,6 +411,7 @@ end
 local function reset()
 	wipe(DB.counts)
 	wipe(DB.rounds)
+	wipe(DB.proven)
 	DB.since = time()
 	DB.missed = 0
 	msg("Counts reset.")
@@ -414,6 +539,9 @@ local function onLootChat(text)
 			end
 		end
 	end
+	if needsCommission(entry) then
+		DB.proven[squash(who)] = true -- a Scourgestone drops only with the commission, whatever the buff read says
+	end
 	checkBreak(who, entry, count(who, entry.key))
 	addCount(who, entry.key, n)
 end
@@ -524,54 +652,90 @@ local function queueReport()
 	waitForChat()
 end
 
--- round N of an item is complete once everyone in the group has at least N
+local function nameList(names)
+	return table.concat(names, ", ", 1, math.min(#names, 3)) .. (#names > 3 and ", ..." or "")
+end
+
+-- every name, as long as it fits one chat line
+local function fullNameList(names)
+	local text, shown = "", 0
+	for _, name in ipairs(names) do
+		local nextText = shown == 0 and name or (text .. ", " .. name)
+		if #nextText > 120 then
+			break
+		end
+		text, shown = nextText, shown + 1
+	end
+	if shown < #names then
+		text = text .. " +" .. (#names - shown) .. " more"
+	end
+	return text
+end
+
+local function entryByKey(key)
+	for _, entry in ipairs(DB.items) do
+		if entry.key == key then
+			return entry
+		end
+	end
+end
+
+-- round N of an item is complete once everyone in the group who takes part has at least N
 checkRound = function(key)
 	if not DB.announce or not groupChannel() then
 		return
 	end
-	local members = roster()
-	if #members < 2 then
+	local entry = entryByKey(key)
+	if not entry then
 		return
 	end
-	local low
-	for _, name in ipairs(members) do
-		local n = count(name, key)
-		low = low and math.min(low, n) or n
+	scanCommission()
+	local low, taking = nil, 0
+	for _, name in ipairs(roster()) do
+		if eligible(name, entry) then
+			local n = count(name, key)
+			low = low and math.min(low, n) or n
+			taking = taking + 1
+		end
 	end
-	if low <= (DB.rounds[key] or 0) then
+	if taking < 2 or low <= (DB.rounds[key] or 0) then
 		return
 	end
 	DB.rounds[key] = low
-	for _, entry in ipairs(DB.items) do
-		if entry.key == key then
-			sendToGroup("Round Robin: " .. entryLabel(entry) .. " round " .. low .. " complete")
-			return
-		end
+	local text = "Round Robin: " .. entryLabel(entry) .. " round " .. low .. " complete"
+	local out = leftOut(entry)
+	if #out > 0 then
+		text = text .. " (left out: " .. fullNameList(out) .. " - no " .. COMMISSION_NAME .. ")"
 	end
+	sendToGroup(text)
 end
 
--- the lowest count of an item among the group (leaving out one player): low, names with it, whether that player is in
-local function lowest(key, except)
-	local members, low, inGroup = roster(), nil, false
-	for _, name in ipairs(members) do
-		if except and squash(name) == squash(except) then
+-- the lowest count of an item among those who take part (leaving out one player): low, names with it,
+-- whether that player is in the group, how many take part
+local function lowest(entry, except)
+	local key = entry.key
+	local low, inGroup, taking = nil, false, 0
+	local function skip(name)
+		return except and squash(name) == squash(except)
+	end
+	for _, name in ipairs(roster()) do
+		if skip(name) then
 			inGroup = true
-		else
+		elseif eligible(name, entry) then
 			local n = count(name, key)
 			low = low and math.min(low, n) or n
 		end
+		if eligible(name, entry) then
+			taking = taking + 1
+		end
 	end
 	local names = {}
-	for _, name in ipairs(members) do
-		if not (except and squash(name) == squash(except)) and count(name, key) == low then
+	for _, name in ipairs(roster()) do
+		if not skip(name) and eligible(name, entry) and count(name, key) == low then
 			names[#names + 1] = name
 		end
 	end
-	return low, names, inGroup, #members
-end
-
-local function nameList(names)
-	return table.concat(names, ", ", 1, math.min(#names, 3)) .. (#names > 3 and ", ..." or "")
+	return low, names, inGroup, taking
 end
 
 -- someone loots while they already have more than the lowest member: out of turn
@@ -579,8 +743,8 @@ checkBreak = function(who, entry, before)
 	if not DB.announce or not groupChannel() then
 		return
 	end
-	local low, owed, inGroup, size = lowest(entry.key, who)
-	if size < 2 or not inGroup or before <= low then
+	local low, owed, inGroup, size = lowest(entry, who)
+	if size < 2 or not inGroup or not low or before <= low or not eligible(who, entry) then
 		return
 	end
 	sendToGroup(("Round Robin: %s broke the round on %s (had %d, %s %s %d)"):format(
@@ -604,8 +768,9 @@ local function onRollStart(rollID)
 	if not entry then
 		return
 	end
-	local low, turn, _, size = lowest(entry.key)
-	if size >= 2 then
+	scanCommission()
+	local low, turn, _, size = lowest(entry)
+	if size >= 2 and low then
 		sendToGroup(("Round Robin: %s up for roll, turn: %s (%d)"):format(entryLabel(entry), nameList(turn), low))
 	end
 	-- several items roll at once: one report after the last of them
@@ -675,7 +840,7 @@ reportLines = function()
 	for i, name in ipairs(list) do
 		local values = {}
 		for _, entry in ipairs(DB.items) do
-			values[#values + 1] = tostring(count(name, entry.key))
+			values[#values + 1] = eligible(name, entry) and tostring(count(name, entry.key)) or "-"
 		end
 		lines[#lines + 1] = padTo(rows[i], widest) .. " " .. table.concat(values, " / ")
 	end
@@ -1254,6 +1419,10 @@ local function cell(row, i)
 		end)
 		c:SetScript("OnEnter", function(self)
 			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+			if self.leftOut then
+				GameTooltip:AddLine("No " .. COMMISSION_NAME, 1, 0.5, 0.5)
+				GameTooltip:AddLine("Left out of this round robin", 1, 1, 1)
+			end
 			GameTooltip:AddLine("Click: type a number", 1, 1, 1)
 			GameTooltip:AddLine("Shift-click +1, right-click -1", 1, 1, 1)
 			GameTooltip:Show()
@@ -1332,11 +1501,15 @@ refresh = function()
 	end
 	for _, player in ipairs(list) do
 		for i, entry in ipairs(items) do
-			note(i, count(player, entry.key))
+			if eligible(player, entry) then
+				note(i, count(player, entry.key))
+			end
 		end
 	end
 	local function paint(fs, col, n)
-		if #list > 1 and hi[col] ~= lo[col] and n == hi[col] then
+		if n == nil then
+			fs:SetTextColor(0.5, 0.5, 0.5) -- left out: no Argent Dawn Commission
+		elseif #list > 1 and hi[col] ~= lo[col] and n == hi[col] then
 			fs:SetTextColor(0.2, 1, 0.2)
 		elseif #list > 1 and hi[col] ~= lo[col] and n == lo[col] then
 			fs:SetTextColor(1, 0.25, 0.25)
@@ -1361,8 +1534,9 @@ refresh = function()
 			c.player = player
 			c:ClearAllPoints()
 			c:SetPoint("LEFT", NAME_W + COL_W * (i - 1), 0)
-			local n = count(player, entry.key)
-			c.text:SetText(n)
+			local n = eligible(player, entry) and count(player, entry.key) or nil
+			c.leftOut = n == nil
+			c.text:SetText(n or "-")
 			paint(c.text, i, n)
 			c:Show()
 		end
@@ -1450,6 +1624,21 @@ SlashCmdList.ROUNDROBINTRACKER = function(input)
 			DB.autoReport = not DB.autoReport
 		end
 		msg("Auto report " .. (DB.autoReport and "on" or "off"))
+	elseif cmd == "commission" or cmd == "ad" then
+		DB.items[#DB.items + 1] = { key = "probe:commission", id = 12843 } -- read even when no Scourgestone is tracked
+		local ok = pcall(scanCommission)
+		table.remove(DB.items)
+		if not ok or (InCombatLockdown and InCombatLockdown()) then
+			msg("Buffs not readable in combat, last known:")
+		end
+		for _, name in ipairs(roster()) do
+			local k = squash(name)
+			local state = DB.proven[k] and "yes (looted one)"
+				or DB.commission[k] == true and "yes"
+				or DB.commission[k] == false and "|cffff6060no|r"
+				or "unknown (counts)"
+			msg(name .. ": " .. state)
+		end
 	else
 		msg("v" .. VERSION .. " commands:")
 		msg("/rrt - window")
@@ -1458,6 +1647,7 @@ SlashCmdList.ROUNDROBINTRACKER = function(input)
 		msg("/rrt list | report | reset")
 		msg("/rrt announce on|off - round done to group (" .. (DB.announce and "on" or "off") .. ")")
 		msg("/rrt autoreport on|off - report when up for roll (" .. (DB.autoReport and "on" or "off") .. ")")
+		msg("/rrt commission - who has the Argent Dawn Commission")
 	end
 end
 
@@ -1473,6 +1663,8 @@ events:RegisterEvent("GROUP_ROSTER_UPDATE")
 events:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 events:RegisterEvent("PLAYER_REGEN_ENABLED")
 events:RegisterEvent("START_LOOT_ROLL")
+events:RegisterEvent("UNIT_AURA")
+events:RegisterEvent("PLAYER_ENTERING_WORLD")
 events:SetScript("OnEvent", function(_, event, ...)
 	if event == "ADDON_LOADED" then
 		if ... == "RoundRobinTracker" then
@@ -1501,14 +1693,25 @@ events:SetScript("OnEvent", function(_, event, ...)
 		if not ok then
 			DB.lastError = tostring(err)
 		end
-	elseif event == "GROUP_ROSTER_UPDATE" then
+	elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+		pcall(scanCommission)
 		refresh()
+	elseif event == "UNIT_AURA" then
+		local unit = ...
+		if type(unit) == "string" and (unit == "player" or unit:match("^party%d") or unit:match("^raid%d"))
+			and anyNeedsCommission() and not (InCombatLockdown and InCombatLockdown()) then
+			local ok, changed = pcall(scanUnit, unit)
+			if ok and changed then
+				refresh()
+			end
+		end
 	elseif event == "START_LOOT_ROLL" then
 		local ok, err = pcall(onRollStart, ...)
 		if not ok then
 			DB.lastError = tostring(err)
 		end
 	elseif event == "PLAYER_REGEN_ENABLED" then
+		pcall(scanCommission) -- aura data readable again
 		flushOutbox() -- combat over: post what waited without waiting for the next tick
 	elseif event == "GET_ITEM_INFO_RECEIVED" then
 		local id = ...
