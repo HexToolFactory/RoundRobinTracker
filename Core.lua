@@ -56,6 +56,8 @@ local function initDB()
 	DB.rounds = DB.rounds or {} -- [item key] = last round announced
 	DB.commission = DB.commission or {} -- [squashed name] = true / false: Argent Dawn Commission buff, last read
 	DB.proven = DB.proven or {} -- [squashed name] = true: looted a Scourgestone since the last reset, so they have it
+	DB.missingSince = DB.missingSince or {} -- [squashed name] = time() the commission was first read missing
+	DB.bonus = DB.bonus or {} -- [squashed name] = { [item key] = rounds skipped while left out, added for turns }
 	if DB.announce == nil then
 		DB.announce = true -- post "round N complete" to group chat
 	end
@@ -182,6 +184,15 @@ end
 
 local refresh -- UI, defined below
 
+-- A missing buff leaves someone out only after GRACE seconds, so a trinket swap or a reconnect (no aura data for
+-- a moment) changes nothing. Offline members are not read at all: a disconnect keeps their last state.
+local GRACE = 60
+local rejoin -- (name) back with the commission after being left out; defined with the round code below
+
+local function missingLongEnough(k)
+	return DB.commission[k] == false and time() - (DB.missingSince[k] or 0) >= GRACE
+end
+
 -- returns true when a state changed
 local function scanUnit(unit)
 	local name = GetUnitName(unit, true)
@@ -189,10 +200,24 @@ local function scanUnit(unit)
 		return false
 	end
 	local has = readCommission(unit)
-	if has == nil or DB.commission[squash(name)] == has then
+	local k = squash(name)
+	if has == nil or DB.commission[k] == has then
 		return false
 	end
-	DB.commission[squash(name)] = has
+	local wasOut = missingLongEnough(k) and not DB.proven[k]
+	DB.commission[k] = has
+	if has then
+		DB.missingSince[k] = nil
+		if wasOut then
+			rejoin(name)
+		end
+	else
+		DB.proven[k] = nil -- seen taking it off: an earlier loot no longer vouches for it
+		DB.missingSince[k] = time()
+		C_Timer.After(GRACE + 1, function()
+			refresh() -- the "-" shows once the grace time is over
+		end)
+	end
 	return true
 end
 
@@ -213,7 +238,8 @@ end
 
 -- does this player take part in the round robin of this item
 local function eligible(name, entry)
-	return not needsCommission(entry) or DB.proven[squash(name)] or DB.commission[squash(name)] ~= false
+	local k = squash(name)
+	return not needsCommission(entry) or DB.proven[k] or not missingLongEnough(k)
 end
 
 local function leftOut(entry)
@@ -380,6 +406,22 @@ local function count(player, key)
 	return DB.counts[player] and DB.counts[player][key] or 0
 end
 
+-- the count used for turns and rounds: someone back from being left out starts at the round the others reached
+-- (DB.bonus is added), not owed the drops they could not see
+local function turnCount(player, key)
+	local bonus = DB.bonus[squash(player)]
+	return count(player, key) + (bonus and bonus[key] or 0)
+end
+
+-- "-" = left out, "1 (3)" = has 1, counts as 3 since coming back
+local function cellText(player, entry)
+	if not eligible(player, entry) then
+		return "-"
+	end
+	local n, t = count(player, entry.key), turnCount(player, entry.key)
+	return t > n and (n .. " (" .. t .. ")") or tostring(n)
+end
+
 local function total(player)
 	local sum = 0
 	for _, entry in ipairs(DB.items) do
@@ -412,6 +454,7 @@ local function reset()
 	wipe(DB.counts)
 	wipe(DB.rounds)
 	wipe(DB.proven)
+	wipe(DB.bonus)
 	DB.since = time()
 	DB.missed = 0
 	msg("Counts reset.")
@@ -540,9 +583,13 @@ local function onLootChat(text)
 		end
 	end
 	if needsCommission(entry) then
-		DB.proven[squash(who)] = true -- a Scourgestone drops only with the commission, whatever the buff read says
+		-- a Scourgestone drops only with the commission, whatever the buff read says
+		if not DB.proven[squash(who)] and not eligible(who, entry) then
+			rejoin(who)
+		end
+		DB.proven[squash(who)] = true
 	end
-	checkBreak(who, entry, count(who, entry.key))
+	checkBreak(who, entry, turnCount(who, entry.key))
 	addCount(who, entry.key, n)
 end
 
@@ -693,7 +740,7 @@ checkRound = function(key)
 	local low, taking = nil, 0
 	for _, name in ipairs(roster()) do
 		if eligible(name, entry) then
-			local n = count(name, key)
+			local n = turnCount(name, key)
 			low = low and math.min(low, n) or n
 			taking = taking + 1
 		end
@@ -722,7 +769,7 @@ local function lowest(entry, except)
 		if skip(name) then
 			inGroup = true
 		elseif eligible(name, entry) then
-			local n = count(name, key)
+			local n = turnCount(name, key)
 			low = low and math.min(low, n) or n
 		end
 		if eligible(name, entry) then
@@ -731,11 +778,26 @@ local function lowest(entry, except)
 	end
 	local names = {}
 	for _, name in ipairs(roster()) do
-		if not skip(name) and eligible(name, entry) and count(name, key) == low then
+		if not skip(name) and eligible(name, entry) and turnCount(name, key) == low then
 			names[#names + 1] = name
 		end
 	end
 	return low, names, inGroup, taking
+end
+
+-- back with the commission after being left out: start at the round the others reached
+rejoin = function(name)
+	local k = squash(name)
+	for _, entry in ipairs(DB.items) do
+		if needsCommission(entry) then
+			local low = lowest(entry, name)
+			local behind = low and (low - turnCount(name, entry.key)) or 0
+			if behind > 0 then
+				DB.bonus[k] = DB.bonus[k] or {}
+				DB.bonus[k][entry.key] = (DB.bonus[k][entry.key] or 0) + behind
+			end
+		end
+	end
 end
 
 -- someone loots while they already have more than the lowest member: out of turn
@@ -840,7 +902,7 @@ reportLines = function()
 	for i, name in ipairs(list) do
 		local values = {}
 		for _, entry in ipairs(DB.items) do
-			values[#values + 1] = eligible(name, entry) and tostring(count(name, entry.key)) or "-"
+			values[#values + 1] = cellText(name, entry)
 		end
 		lines[#lines + 1] = padTo(rows[i], widest) .. " " .. table.concat(values, " / ")
 	end
@@ -1422,6 +1484,8 @@ local function cell(row, i)
 			if self.leftOut then
 				GameTooltip:AddLine("No " .. COMMISSION_NAME, 1, 0.5, 0.5)
 				GameTooltip:AddLine("Left out of this round robin", 1, 1, 1)
+			elseif self.floor then
+				GameTooltip:AddLine("Back with the commission: counts as " .. self.floor, 1, 0.82, 0)
 			end
 			GameTooltip:AddLine("Click: type a number", 1, 1, 1)
 			GameTooltip:AddLine("Shift-click +1, right-click -1", 1, 1, 1)
@@ -1502,7 +1566,7 @@ refresh = function()
 	for _, player in ipairs(list) do
 		for i, entry in ipairs(items) do
 			if eligible(player, entry) then
-				note(i, count(player, entry.key))
+				note(i, turnCount(player, entry.key))
 			end
 		end
 	end
@@ -1534,9 +1598,10 @@ refresh = function()
 			c.player = player
 			c:ClearAllPoints()
 			c:SetPoint("LEFT", NAME_W + COL_W * (i - 1), 0)
-			local n = eligible(player, entry) and count(player, entry.key) or nil
+			local n = eligible(player, entry) and turnCount(player, entry.key) or nil
 			c.leftOut = n == nil
-			c.text:SetText(n or "-")
+			c.floor = n and n > count(player, entry.key) and n or nil
+			c.text:SetText(cellText(player, entry))
 			paint(c.text, i, n)
 			c:Show()
 		end
@@ -1633,8 +1698,10 @@ SlashCmdList.ROUNDROBINTRACKER = function(input)
 		end
 		for _, name in ipairs(roster()) do
 			local k = squash(name)
+			local wait = DB.commission[k] == false and GRACE - (time() - (DB.missingSince[k] or 0))
 			local state = DB.proven[k] and "yes (looted one)"
 				or DB.commission[k] == true and "yes"
+				or wait and wait > 0 and ("no, left out in " .. math.ceil(wait) .. " s")
 				or DB.commission[k] == false and "|cffff6060no|r"
 				or "unknown (counts)"
 			msg(name .. ": " .. state)

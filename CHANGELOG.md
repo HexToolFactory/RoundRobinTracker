@@ -4,7 +4,9 @@
 - Scourgestones (Minion's, Invader's, Corruptor's): group members without the Argent Dawn Commission buff are left out
   of the round. They show "-" in the window and the table, are not in the turn line, and the round message names them:
   "round 1 complete (left out: Bob Stone - no Argent Dawn Commission)".
+- A missing buff counts only after 60 s (trinket swap, reconnect). Offline members keep their last state.
 - The buff is read out of combat only; the last state read is kept. Looting a Scourgestone counts as having it.
+- Back with the commission: they start at the round the others reached, shown as "0 (2)" (has 0, counts as 2).
 - `/rrt commission` lists who has it.
 
 ## 0.8.1

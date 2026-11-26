@@ -37,7 +37,11 @@ table, not in the turn line, and named in the round message:
 ```
 Round Robin: [Corruptor's Scourgestone] round 1 complete (left out: Bob Stone - no Argent Dawn Commission)
 ```
-Buffs can only be read out of combat; the last state read is kept. Someone who loots a Scourgestone counts again.
+- A missing buff counts only after 60 s, so a trinket swap or a reconnect changes nothing. Offline members keep
+  their last state.
+- Buffs can only be read out of combat; the last state read is kept.
+- Back with the commission (or looting a Scourgestone, which proves it): they start at the round the others
+  reached instead of being owed the drops they could not see. Shown as "0 (2)": has 0, counts as 2.
 `/rrt commission` shows who has it.
 
 ## Commands
